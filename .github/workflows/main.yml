@@ -1,9 +1,9 @@
-fname: oracao-automacao worker
+name: oracao-automacao worker
 
 on:
-  workflow_dispatch: {}          # permite rodar manualmente
+  workflow_dispatch: {}
   schedule:
-    - cron: "0 * * * *"          # roda de hora em hora (UTC)
+    - cron: "0 * * * *"   # roda de hora em hora (UTC)
 
 jobs:
   render:
@@ -27,12 +27,11 @@ jobs:
           pip install google-api-python-client google-auth google-auth-httplib2 google-auth-oauthlib \
                       gTTS pillow moviepy
 
-            - name: Write service account key
+      - name: Write service account key
         run: |
           cat > service_account.json <<'JSON'
           ${{ secrets.SERVICE_ACCOUNT_JSON }}
           JSON
-
 
       - name: Run worker
         env:
