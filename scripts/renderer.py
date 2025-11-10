@@ -1,194 +1,121 @@
 # scripts/renderer.py
-import os, io, json, random, tempfile, subprocess
-from datetime import datetime, timezone
-from gtts import gTTS
-from google.oauth2.credentials import Credentials
+# -*- coding: utf-8 -*-
+"""
+Renderer mínimo para validar OAuth e acesso ao Drive antes do pipeline de vídeo.
+- Usa o MESMO modelo de OAuth do worker (client id/secret + refresh token).
+- Confere/garante pastas-base e grava um log de batimento do renderer.
+- Depois, expandiremos para o render real (TTS, mix, transições, SRT e thumbnail).
+"""
+
+import os
+import io
+from datetime import datetime
+
 from googleapiclient.discovery import build
-from googleapiclient.http import MediaIoBaseDownload, MediaIoBaseUpload
+from googleapiclient.errors import HttpError
+from googleapiclient.http import MediaIoBaseUpload
+from google.oauth2.credentials import Credentials
+from google.auth.transport.requests import Request
 
-# ---- ENV ----
-CLIENT_ID = os.environ['OAUTH_CLIENT_ID']
-CLIENT_SECRET = os.environ['OAUTH_CLIENT_SECRET']
-REFRESH_TOKEN = os.environ['OAUTH_REFRESH_TOKEN']
-ROOT_ID = os.environ.get('DRIVE_ROOT_FOLDER_ID')  # usamos o ID direto
-
+# ===== Scopes EXATOS (iguais ao refresh token gerado) =====
 SCOPES = [
-  'https://www.googleapis.com/auth/drive.file',
-  'https://www.googleapis.com/auth/drive.readonly',
-  'https://www.googleapis.com/auth/drive.metadata.readonly'
+    "https://www.googleapis.com/auth/drive.file",
+    "https://www.googleapis.com/auth/drive.metadata.readonly",
+    "https://www.googleapis.com/auth/spreadsheets.readonly",
 ]
 
-def drive():
-  creds = Credentials(
-      None, refresh_token=REFRESH_TOKEN, token_uri='https://oauth2.googleapis.com/token',
-      client_id=CLIENT_ID, client_secret=CLIENT_SECRET, scopes=SCOPES
-  )
-  return build('drive','v3',credentials=creds, cache_discovery=False)
+# ===== Helpers de Drive =====
+def find_child_by_name(drive, parent_id, name):
+    q = f"'{parent_id}' in parents and trashed=false and name='{name}'"
+    r = drive.files().list(q=q, fields="files(id,name,mimeType)").execute()
+    files = r.get("files", [])
+    return files[0] if files else None
 
-def ensure_folder(svc, parent_id, name):
-  q = f"'{parent_id}' in parents and trashed=false and mimeType='application/vnd.google-apps.folder' and name='{name}'"
-  r = svc.files().list(q=q, fields="files(id,name)").execute().get('files',[])
-  if r: return r[0]['id']
-  meta = {'name':name,'mimeType':'application/vnd.google-apps.folder','parents':[parent_id]}
-  return svc.files().create(body=meta, fields="id").execute()['id']
+def ensure_folder(drive, parent_id, name):
+    f = find_child_by_name(drive, parent_id, name)
+    if f and f.get("mimeType") == "application/vnd.google-apps.folder":
+        return f["id"]
+    meta = {
+        "name": name,
+        "mimeType": "application/vnd.google-apps.folder",
+        "parents": [parent_id],
+    }
+    f = drive.files().create(body=meta, fields="id,name").execute()
+    return f["id"]
 
-def list_files(svc, parent_id, name_contains=None):
-  q = [f"'{parent_id}' in parents","trashed=false"]
-  if name_contains: q.append(f"name contains '{name_contains}'")
-  r = svc.files().list(q=" and ".join(q), orderBy="modifiedTime desc",
-                       fields="files(id,name,mimeType,modifiedTime,size)").execute()
-  return r.get('files',[])
+def upload_text(drive, parent_id, filename, content):
+    existing = find_child_by_name(drive, parent_id, filename)
+    if existing:
+        drive.files().delete(fileId=existing["id"]).execute()
+    media = MediaIoBaseUpload(io.BytesIO(content.encode("utf-8")), mimetype="text/plain")
+    meta = {"name": filename, "parents": [parent_id]}
+    return drive.files().create(body=meta, media_body=media, fields="id,name").execute()
 
-def download_text(svc, file_id):
-  req = svc.files().get_media(fileId=file_id)
-  buf = io.BytesIO()
-  MediaIoBaseDownload(buf, req).next_chunk()
-  return buf.getvalue().decode('utf-8','ignore')
+# ===== Autenticação OAuth (com refresh token) =====
+def build_services_from_oauth():
+    client_id = os.getenv("OAUTH_CLIENT_ID", "").strip()
+    client_secret = os.getenv("OAUTH_CLIENT_SECRET", "").strip()
+    refresh_token = os.getenv("OAUTH_REFRESH_TOKEN", "").strip()
 
-def download_bytes(svc, file_id):
-  req = svc.files().get_media(fileId=file_id)
-  buf = io.BytesIO(); done=False
-  d = MediaIoBaseDownload(buf, req)
-  while not done:
-    _, done = d.next_chunk()
-  return buf.getvalue()
+    if not client_id or not client_secret or not refresh_token:
+        raise RuntimeError("Falta OAUTH_CLIENT_ID, OAUTH_CLIENT_SECRET ou OAUTH_REFRESH_TOKEN nos Secrets.")
 
-def upload_binary(svc, parent_id, name, data_bytes, mime):
-  media = MediaIoBaseUpload(io.BytesIO(data_bytes), mimetype=mime, resumable=False)
-  meta = {'name': name, 'parents':[parent_id]}
-  return svc.files().create(body=meta, media_body=media, fields="id,name").execute()
+    creds = Credentials(
+        None,
+        refresh_token=refresh_token,
+        token_uri="https://oauth2.googleapis.com/token",
+        client_id=client_id,
+        client_secret=client_secret,
+        scopes=SCOPES,
+    )
+    # força refresh para validar escopos/credenciais
+    creds.refresh(Request())
 
-def latest_work_orders(svc, cfg_id):
-  files = list_files(svc, cfg_id, "work_orders_")
-  return files[0] if files else None
+    drive = build("drive", "v3", credentials=creds, cache_discovery=False)
+    sheets = build("sheets", "v4", credentials=creds, cache_discovery=False)
+    return drive, sheets
 
-def pick_music(svc, mus_bg_id, mus_ave_id, policy, faixa):
-  if policy=='ave_maria':
-    if faixa:
-      r = svc.files().list(q=f"'{mus_ave_id}' in parents and trashed=false and name='{faixa}'",
-                           fields="files(id,name)").execute().get('files',[])
-      if r: return r[0]
-    r = list_files(svc, mus_ave_id)
-    if not r: raise SystemExit("Ave Maria não encontrada em 01_assets_musicas_ave_maria")
-    return r[0]
-  r = list_files(svc, mus_bg_id)
-  if not r: raise SystemExit("BG músicas vazia em 01_assets_musicas")
-  random.shuffle(r); return r[0]
-
-def tsv_for_slot(svc, scripts_id, slot):
-  files = list_files(svc, scripts_id, f"run_{slot}.tsv")
-  return download_text(svc, files[0]['id']) if files else None
-
-def synth_tts(text, lang):
-  gtts_lang = {'pt':'pt','en':'en','es':'es','pl':'pl'}.get(lang,'pt')
-  tts = gTTS(text=text, lang=gtts_lang)
-  buf = io.BytesIO(); tts.write_to_fp(buf)
-  return buf.getvalue()
-
-def fix_image_1080(src_bytes):
-  # força 1920x1080 com letterbox
-  in_tmp = tempfile.NamedTemporaryFile(delete=False).name
-  out_tmp = tempfile.NamedTemporaryFile(delete=False, suffix='.jpg').name
-  with open(in_tmp,'wb') as f: f.write(src_bytes)
-  subprocess.check_call([
-    'ffmpeg','-y','-i',in_tmp,
-    '-vf','scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2',
-    '-q:v','2', out_tmp
-  ])
-  return out_tmp
-
-def make_video(img_paths, tts_wav, music_wav, out_path):
-  # 40 imagens x 12s = 480s (8 min). Ajusta se tiver menos imagens.
-  dur = max(480 // max(1,len(img_paths)), 8)
-  concat_txt = "\n".join([f"file '{p}'\nduration {dur}" for p in img_paths]) + f"\nfile '{img_paths[-1]}'\n"
-  listfile = tempfile.NamedTemporaryFile('w', delete=False, suffix='.txt').name
-  with open(listfile,'w') as f: f.write(concat_txt)
-
-  subprocess.check_call([
-    'ffmpeg','-y',
-    '-f','concat','-safe','0','-i', listfile,
-    '-i', tts_wav, '-i', music_wav,
-    '-filter_complex',
-    "[0:v]scale=1920:1080,format=yuv420p[v];"
-    "[2:a]volume=0.15[bg];"
-    "[1:a][bg]sidechaincompress=threshold=0.02:ratio=8:attack=20:release=200[mix]",
-    '-map','[v]','-map','[mix]',
-    '-r','25','-c:v','libx264','-pix_fmt','yuv420p','-preset','medium','-crf','18',
-    '-shortest', out_path
-  ])
-
+# ===== Main =====
 def run():
-  svc = drive()
-  # Pastas base
-  cfg_id     = ensure_folder(svc, ROOT_ID, '00_config')
-  scripts_id = ensure_folder(svc, ROOT_ID, '02_scripts_autogerados')
-  out_pt     = ensure_folder(svc, ROOT_ID, '03_outputs_videos_pt')
-  out_en     = ensure_folder(svc, ROOT_ID, '03_outputs_videos_en')
-  out_es     = ensure_folder(svc, ROOT_ID, '03_outputs_videos_es')
-  out_pl     = ensure_folder(svc, ROOT_ID, '03_outputs_videos_pl')
-  mus_bg_id  = ensure_folder(svc, ROOT_ID, '01_assets_musicas')
-  mus_ave_id = ensure_folder(svc, ROOT_ID, '01_assets_musicas_ave_maria')
-  img_jesus  = ensure_folder(svc, ROOT_ID, '01_assets_imagens_jesus')
-  img_maria  = ensure_folder(svc, ROOT_ID, '01_assets_imagens_maria')
+    root_id = os.getenv("DRIVE_ROOT_FOLDER_ID", "").strip()
+    if not root_id:
+        raise RuntimeError("Falta DRIVE_ROOT_FOLDER_ID nos Secrets.")
 
-  wo = latest_work_orders(svc, cfg_id)
-  if not wo:
-    print("Sem work_orders*.json em 00_config.")
-    return
-  jobs = json.loads(download_text(svc, wo['id']))
-  if not jobs:
-    print("JSON vazio.")
-    return
+    drive, _ = build_services_from_oauth()
 
-  for job in jobs:
-    idioma = job['idioma']
-    slot = job['slot']
-    personagem = 'maria' if slot.startswith('maria') else 'jesus'
-    out_folder = {'pt':out_pt,'en':out_en,'es':out_es,'pl':out_pl}.get(idioma, out_pt)
+    # Garante estrutura mínima usada pelo renderer
+    cfg_id  = ensure_folder(drive, root_id, "00_config")
+    out_pt  = ensure_folder(drive, root_id, "03_outputs_videos_pt")
+    out_en  = ensure_folder(drive, root_id, "03_outputs_videos_en")
+    out_es  = ensure_folder(drive, root_id, "03_outputs_videos_es")
+    out_pl  = ensure_folder(drive, root_id, "03_outputs_videos_pl")
+    th_pt   = ensure_folder(drive, root_id, "04_outputs_thumbnails_pt")
+    th_en   = ensure_folder(drive, root_id, "04_outputs_thumbnails_en")
+    th_es   = ensure_folder(drive, root_id, "04_outputs_thumbnails_es")
+    th_pl   = ensure_folder(drive, root_id, "04_outputs_thumbnails_pl")
+    logs_id = ensure_folder(drive, root_id, "05_logs")
 
-    # TSV → texto TTS
-    tsv_txt = tsv_for_slot(svc, scripts_id, slot)
-    if not tsv_txt:
-      print(f"TSV ausente para {slot}. Pulando.")
-      continue
-    lines = [l.split('\t') for l in tsv_txt.strip().split('\n') if l.strip()]
-    phrases = [c[3] for c in lines if len(c)>=4]
-    tts_text = " ".join(phrases)
+    # Apenas validação por enquanto — depois entraremos com render real
+    now = datetime.utcnow().strftime("%Y-%m-%d_%H%M%S")
+    lines = [
+        f"UTC: {now}",
+        "status: OK",
+        "step: renderer_oauth_validated_and_folders_checked",
+        f"root: {root_id}",
+        f"00_config: {cfg_id}",
+        f"03_pt: {out_pt} | 03_en: {out_en} | 03_es: {out_es} | 03_pl: {out_pl}",
+        f"04_pt: {th_pt}  | 04_en: {th_en}  | 04_es: {th_es}  | 04_pl: {th_pl}",
+        "scopes: " + ", ".join(SCOPES),
+    ]
+    upload_text(drive, logs_id, f"log_renderer_{now}.txt", "\n".join(lines))
 
-    # TTS (mp3 → wav 48k)
-    tts_mp3 = synth_tts(tts_text, idioma)
-    tts_mp3_path = tempfile.NamedTemporaryFile(delete=False, suffix='.mp3').name
-    with open(tts_mp3_path,'wb') as f: f.write(tts_mp3)
-    tts_wav_path = tempfile.NamedTemporaryFile(delete=False, suffix='.wav').name
-    subprocess.check_call(['ffmpeg','-y','-i',tts_mp3_path,'-ar','48000','-ac','2',tts_wav_path])
-
-    # Música
-    mus_file = pick_music(svc, mus_bg_id, mus_ave_id, job.get('policy','bg_random'), job.get('faixa_ave_maria',''))
-    mus_src = tempfile.NamedTemporaryFile(delete=False).name
-    with open(mus_src,'wb') as f: f.write(download_bytes(svc, mus_file['id']))
-    music_wav = tempfile.NamedTemporaryFile(delete=False, suffix='.wav').name
-    subprocess.check_call(['ffmpeg','-y','-i',mus_src,'-ar','48000','-ac','2',music_wav])
-
-    # Imagens (40)
-    imgs_parent = img_maria if personagem=='maria' else img_jesus
-    imgs = [f for f in list_files(svc, imgs_parent) if f['mimeType'].startswith('image/')]
-    if not imgs:
-      print(f"Sem imagens para {personagem}.")
-      continue
-    random.shuffle(imgs)
-    imgs = imgs[:40] if len(imgs)>=40 else imgs
-    fixed_paths = [fix_image_1080(download_bytes(svc, f['id'])) for f in imgs]
-
-    # Render
-    ts = datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')
-    out_name = f"{slot}_{idioma}_{ts}.mp4"
-    out_file = tempfile.NamedTemporaryFile(delete=False, suffix='.mp4').name
-    make_video(fixed_paths, tts_wav_path, music_wav, out_file)
-
-    # Upload MP4
-    with open(out_file,'rb') as fh:
-      upload_binary(svc, out_folder, out_name, fh.read(), 'video/mp4')
-    print(f"OK: {out_name}")
-
-if __name__ == '__main__':
-  run()
+if __name__ == "__main__":
+    try:
+        run()
+        print("Renderer finalizado com sucesso.")
+    except HttpError as e:
+        print(f"HttpError: {e}")
+        raise
+    except Exception as e:
+        print(f"Erro: {e}")
+        raise
