@@ -1,97 +1,113 @@
-import os, sys, io, json, datetime
-from googleapiclient.discovery import build
-from googleapiclient.http import MediaIoBaseUpload
-from google.oauth2.credentials import Credentials
-from google.auth.transport.requests import Request
+# scripts/diag_oauth.py
+# Diagnóstico de OAuth/Drive sem definir scopes no código.
+# Usa os escopos já embutidos no refresh_token.
+import os
+import sys
+import json
+import datetime
 import requests
 
-REQUIRED_SCOPES = [
-    "https://www.googleapis.com/auth/drive",                 # leitura + escrita
-    "https://www.googleapis.com/auth/spreadsheets.readonly", # leitura sheets
-]
+from google.oauth2.credentials import Credentials
+from google.auth.transport.requests import Request
+from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
 
-OAUTH_CLIENT_ID     = os.getenv("OAUTH_CLIENT_ID")
-OAUTH_CLIENT_SECRET = os.getenv("OAUTH_CLIENT_SECRET")
-OAUTH_REFRESH_TOKEN = os.getenv("OAUTH_REFRESH_TOKEN")
-DRIVE_ROOT_ID       = os.getenv("DRIVE_ROOT_FOLDER_ID")
-SHEET_ID            = os.getenv("SHEET_ID")
+# ---------- Config ----------
+TOKEN_URI = "https://oauth2.googleapis.com/token"
+TOKENINFO_URL = "https://oauth2.googleapis.com/tokeninfo"
 
-def die(msg, code=1):
-    print("DIAG_FAIL:", msg)
+def fail(msg: str, code: int = 1):
+    print(f"DIAG_FAIL: {msg}")
     sys.exit(code)
 
-def tokeninfo(access_token):
+def creds_from_env() -> Credentials:
+    """Monta credenciais SEM scopes (deixa o refresh_token decidir)."""
     try:
-        r = requests.get("https://oauth2.googleapis.com/tokeninfo", params={"access_token": access_token}, timeout=20)
+        return Credentials(
+            token=None,
+            refresh_token=os.environ["OAUTH_REFRESH_TOKEN"],
+            client_id=os.environ["OAUTH_CLIENT_ID"],
+            client_secret=os.environ["OAUTH_CLIENT_SECRET"],
+            token_uri=TOKEN_URI,
+        )
+    except KeyError as e:
+        fail(f"Variável de ambiente ausente: {e}")
+
+def tokeninfo(access_token: str) -> dict:
+    try:
+        r = requests.get(TOKENINFO_URL, params={"access_token": access_token}, timeout=20)
         if r.status_code == 200:
             return r.json()
-        return {"error": f"tokeninfo_http_{r.status_code}", "body": r.text[:200]}
+        return {"error": f"tokeninfo_http_{r.status_code}", "body": r.text[:500]}
     except Exception as e:
         return {"error": str(e)}
 
-def main():
-    # 0) Secrets básicos
-    for k,v in {"OAUTH_CLIENT_ID":OAUTH_CLIENT_ID, "OAUTH_CLIENT_SECRET":OAUTH_CLIENT_SECRET, "OAUTH_REFRESH_TOKEN":OAUTH_REFRESH_TOKEN, "DRIVE_ROOT_FOLDER_ID":DRIVE_ROOT_ID}.items():
-        if not v:
-            die(f"Secret ausente: {k}")
-
-    # 1) Monta credenciais com escopos finais
-    creds = Credentials(
-        None,
-        refresh_token=OAUTH_REFRESH_TOKEN,
-        token_uri="https://oauth2.googleapis.com/token",
-        client_id=OAUTH_CLIENT_ID,
-        client_secret=OAUTH_CLIENT_SECRET,
-        scopes=REQUIRED_SCOPES,
+def ensure_folder_exists(drive_svc, parent_id: str, name: str) -> str:
+    q = (
+        f"'{parent_id}' in parents and "
+        f"name = '{name}' and "
+        "mimeType = 'application/vnd.google-apps.folder' and "
+        "trashed = false"
     )
+    resp = drive_svc.files().list(q=q, fields="files(id,name)").execute()
+    items = resp.get("files", [])
+    if items:
+        return items[0]["id"]
+    # não cria — apenas diagnostica
+    return ""
 
-    # 2) Refresh para obter access_token com os escopos concedidos
-    creds.refresh(Request())
-    at = creds.token
-    if not at:
-        die("Access token não obtido do refresh")
+def main():
+    started = datetime.datetime.utcnow().strftime("%Y-%m-%d_%H%M%S")
+    root_id = os.environ.get("DRIVE_ROOT_FOLDER_ID", "").strip()
+    sheet_id = os.environ.get("SHEET_ID", "").strip()
 
-    # 3) tokeninfo: conferir e-mail e escopos concedidos
-    info = tokeninfo(at)
-    print("tokeninfo:", json.dumps(info, ensure_ascii=False))
-    if "email" in info:
-        email = info["email"]
-    else:
-        # fallback: Drive About
-        drive = build("drive", "v3", credentials=creds, cache_discovery=False)
-        me = drive.about().get(fields="user(emailAddress,displayName)").execute()
-        email = me["user"]["emailAddress"]
-        print("drive.about.user:", me["user"])
+    if not root_id:
+        fail("DRIVE_ROOT_FOLDER_ID não definido nos secrets.")
 
-    granted_scopes = set(info.get("scope", "").split()) if "scope" in info else set()
-    # Se tokeninfo não trouxe scope, vamos assumir os REQUIRED_SCOPES e validar na prática (operação abaixo)
-    print("granted_scopes:", " ".join(sorted(granted_scopes)) if granted_scopes else "(não reportado por tokeninfo)")
+    # 1) Refresh sem scopes no código
+    creds = creds_from_env()
+    try:
+        creds.refresh(Request())
+    except Exception as e:
+        fail(f"RefreshError: {e}")
 
-    # 4) Checagem prática: listagem em 00_config e escrita em 05_logs
-    drive = build("drive", "v3", credentials=creds, cache_discovery=False)
+    # 2) Inspeciona escopos reais do access_token
+    ti = tokeninfo(creds.token or "")
+    scopes = ti.get("scope", "")
+    # pode vir string com escopos separados por espaço ou vazio
+    scopes_list = scopes.split() if isinstance(scopes, str) else []
 
-    # 4.1) Descobrir subpastas críticas
-    q = f"'{DRIVE_ROOT_ID}' in parents and trashed=false"
-    children = drive.files().list(q=q, fields="files(id,name)").execute().get("files", [])
-    names = {c["name"]: c["id"] for c in children}
-    for required in ["00_config", "05_logs"]:
-        if required not in names:
-            die(f"Pasta obrigatória ausente em ROOT: {required}")
-    cfg_id = names["00_config"]
-    logs_id = names["05_logs"]
+    # 3) Conecta no Drive
+    try:
+        drive = build("drive", "v3", credentials=creds)
+    except Exception as e:
+        fail(f"Falha ao buildar serviço Drive: {e}")
 
-    # 4.2) Teste de leitura em 00_config
-    _ = drive.files().list(q=f"'{cfg_id}' in parents and trashed=false", pageSize=1, fields="files(id,name)").execute()
+    # 4) Verifica pasta raiz e 00_config
+    try:
+        about = drive.about().get(fields="user(emailAddress,displayName)").execute()
+        user_email = about.get("user", {}).get("emailAddress", "unknown")
 
-    # 4.3) Teste de escrita em 05_logs (requer escopo drive FULL)
-    now = datetime.datetime.utcnow().strftime("%Y%m%d_%H%M%S")
-    content = f"diag_ok at {now} UTC | account={email}"
-    media = MediaIoBaseUpload(io.BytesIO(content.encode("utf-8")), mimetype="text/plain")
-    meta = {"name": f"diag_{now}.txt", "parents": [logs_id]}
-    drive.files().create(body=meta, media_body=media, fields="id,name").execute()
+        # valida acesso ao root
+        _ = drive.files().get(fileId=root_id, fields="id,name").execute()
 
-    print("DIAG_OK: email=", email)
-    print("DIAG_OK: write test succeeded; renderer pode escrever nos outputs.")
+        cfg_id = ensure_folder_exists(drive, root_id, "00_config")
+
+    except HttpError as he:
+        fail(f"Drive HttpError: {he}")
+    except Exception as e:
+        fail(f"Erro ao consultar Drive: {e}")
+
+    out = {
+        "utc": started,
+        "status": "OK",
+        "who": user_email,
+        "root_id": root_id,
+        "config_id": cfg_id or "(00_config não encontrada – só diagnóstico, não cria)",
+        "sheet_id": sheet_id or "(não definido)",
+        "scopes_from_tokeninfo": scopes_list,
+    }
+    print(json.dumps(out, ensure_ascii=False, indent=2))
     sys.exit(0)
 
 if __name__ == "__main__":
