@@ -76,8 +76,7 @@ def pick_any(svc, folder_id, exts):
     f=random.choice(cand)
     # download to tmp
     req = svc.files().get_media(fileId=f['id'])
-    fd,tmp = tempfile.mkstemp(suffix='_'+f['name'])
-    os.close(fd)
+    fd,tmp = tempfile.mkstemp(suffix='_'+f['name']); os.close(fd)
     with open(tmp,'wb') as out:
         downloader = MediaIoBaseDownload(out, req)
         done=False
@@ -135,7 +134,7 @@ def build_slideshow(imgs, dur, out_mp4):
     prep = ';'.join([f'[{i}:v]{zoom},format=yuv420p[v{i}]' for i in range(len(imgs))])
     chain = ';'.join([prep]+xfade_chain)
     final = f'-map [v{len(imgs)-1}] -r {FPS} -pix_fmt yuv420p -movflags +faststart -vf scale={W}:{H}'
-    cmd = f'ffmpeg -y {inputs} -filter_complex "{chain}" -t {dur:.3f} {final} "{out_mp4}""
+    cmd = f'ffmpeg -y {inputs} -filter_complex "{chain}" -t {dur:.3f} {final} "{out_mp4}"'
     run(cmd)
 
 def mix_av(narr_wav, music_wav, target_sec, out_wav):
