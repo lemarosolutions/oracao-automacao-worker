@@ -17,22 +17,28 @@ ZOOM = 1.08          # leve Ken Burns
 XFAD = 0.6           # crossfade entre imagens
 SAY_TYPES = {'exame','suplica','verso','intercessao','agradecimento','encerramento','cta','texto','mensagem'}
 
+# Escopos CORRETOS – permite ler QUALQUER arquivo do Drive + Sheets (evita 403 appNotAuthorizedToFile)
+SCOPES = [
+    "https://www.googleapis.com/auth/drive.readonly",
+    "https://www.googleapis.com/auth/drive.metadata.readonly",
+    "https://www.googleapis.com/auth/drive.file",
+    "https://www.googleapis.com/auth/spreadsheets.readonly"
+]
+
 # -------------------- OAUTH ---------------------
 def svc_from_oauth():
     client_id     = os.getenv('OAUTH_CLIENT_ID')
     client_secret = os.getenv('OAUTH_CLIENT_SECRET')
     refresh_token = os.getenv('OAUTH_REFRESH_TOKEN')
     token_uri = 'https://oauth2.googleapis.com/token'
-    creds = Credentials(None,
-                        refresh_token=refresh_token,
-                        token_uri=token_uri,
-                        client_id=client_id,
-                        client_secret=client_secret,
-                        scopes=[
-                            'https://www.googleapis.com/auth/drive.file',
-                            'https://www.googleapis.com/auth/drive.metadata.readonly',
-                            'https://www.googleapis.com/auth/spreadsheets.readonly'
-                        ])
+    creds = Credentials(
+        None,
+        refresh_token=refresh_token,
+        token_uri=token_uri,
+        client_id=client_id,
+        client_secret=client_secret,
+        scopes=SCOPES
+    )
     creds.refresh(Request())
     return build('drive','v3',credentials=creds)
 
@@ -107,16 +113,14 @@ def seconds_of(audio_path):
     return float(out.strip())
 
 def build_tts(text, out_wav):
-    # gTTS -> mp3 -> wav; grave (pitch down) ~10%
+    # gTTS -> mp3 -> wav; leve ajuste de pitch
     tmp_mp3 = out_wav.replace('.wav','.mp3')
     gTTS(text=text, lang='pt', slow=False).save(tmp_mp3)
-    # pitch down: asetrate + atempo (aprox -2 semitons)
     run(f'ffmpeg -y -i "{tmp_mp3}" -filter:a "asetrate=44100*0.89,aresample=44100,atempo=1.12" "{out_wav}"')
     os.remove(tmp_mp3)
 
 def build_slideshow(imgs, dur, out_mp4):
     if len(imgs)<2:
-        # duplica se necessário
         if imgs: imgs = imgs*2
         else: raise RuntimeError('Sem imagens para slideshow')
     per = max(3.0, (dur - (len(imgs)-1)*XFAD) / len(imgs))
@@ -128,11 +132,10 @@ def build_slideshow(imgs, dur, out_mp4):
         b = f'{i+1}:v'
         out = f'v{i+1}'
         xfade_chain.append(f'[{a}][{b}]xfade=transition=crossfade:duration={XFAD}:offset={(i+1)*per + i*XFAD:.3f}[{out}]')
-    # filtros por entrada
     prep = ';'.join([f'[{i}:v]{zoom},format=yuv420p[v{i}]' for i in range(len(imgs))])
     chain = ';'.join([prep]+xfade_chain)
     final = f'-map [v{len(imgs)-1}] -r {FPS} -pix_fmt yuv420p -movflags +faststart -vf scale={W}:{H}'
-    cmd = f'ffmpeg -y {inputs} -filter_complex "{chain}" -t {dur:.3f} {final} "{out_mp4}"'
+    cmd = f'ffmpeg -y {inputs} -filter_complex "{chain}" -t {dur:.3f} {final} "{out_mp4}""
     run(cmd)
 
 def mix_av(narr_wav, music_wav, target_sec, out_wav):
@@ -145,10 +148,8 @@ def mix_av(narr_wav, music_wav, target_sec, out_wav):
 def make_thumb(base_img, title, out_png):
     img = Image.open(base_img).convert('RGB').resize((W,H))
     draw = ImageDraw.Draw(img)
-    # caixa preta translúcida
     overlay = Image.new('RGBA', img.size, (0,0,0,140))
     img = Image.alpha_composite(img.convert('RGBA'), overlay)
-    # texto
     fsize = 88
     try:
         font = ImageFont.truetype("DejaVuSans-Bold.ttf", fsize)
@@ -196,7 +197,6 @@ def narration_from_rows(rows):
             val=clean_line(r['txt'])
             if val: texts.append(val)
     base=' '.join(texts)
-    # est. 130 wpm ~ 2.16 wps -> 480s ~ 1036 palavras; se pouco, repete suavemente
     words=base.split()
     if len(words)<700:
         rep = math.ceil(900/ max(1,len(words)))
@@ -207,6 +207,7 @@ def narration_from_rows(rows):
 def run():
     svc = svc_from_oauth()
     ROOT = os.getenv('DRIVE_ROOT_FOLDER_ID')
+
     # pastas
     cfg_id  = ensure_folder(svc, ROOT, '00_config')
     out_pt  = ensure_folder(svc, ROOT, '03_outputs_videos_pt')
@@ -223,32 +224,40 @@ def run():
     mus_bg  = ensure_folder(svc, ROOT, '01_assets_musicas')
     mus_am  = ensure_folder(svc, ROOT, '01_assets_musicas_ave_maria')
 
-    # último work_order
+    # último work_order (compatível com lista direta OU {"orders":[...]})
     q = f"'{cfg_id}' in parents and trashed=false and name contains 'work_orders_'"
     r = svc.files().list(q=q, orderBy='modifiedTime desc', pageSize=1,
                          fields="files(id,name)").execute()
-    if not r.get('files'): 
+    if not r.get('files'):
         raise RuntimeError('Nenhum work_orders_*.json encontrado em 00_config.')
     wo_id = r['files'][0]['id']
-    work = json.loads(download_text(svc, wo_id))
+    raw = json.loads(download_text(svc, wo_id))
+    jobs = raw['orders'] if isinstance(raw, dict) and 'orders' in raw else (raw if isinstance(raw, list) else [])
+    if not jobs:
+        raise RuntimeError('work_orders vazio ou inválido.')
 
     tmpdir = tempfile.mkdtemp()
     try:
-        for job in work:
-            lang = job['idioma']
-            slot = job['slot']
-            title= job['title']
-            policy = job.get('policy','bg_random').lower()
+        for job in jobs:
+            lang  = job.get('idioma','pt')
+            slot  = job['slot']
+            title = job.get('title','')
+            policy = (job.get('musica_policy') or job.get('policy') or 'bg_random').lower()
 
-            # pega TSV run_<slot>.tsv da pasta 02_scripts_autogerados
+            # pega TSV run_<slot>_{lang}.tsv OU run_<slot>.tsv (fallback)
             scripts_id = ensure_folder(svc, ROOT, '02_scripts_autogerados')
-            tsq = f"'{scripts_id}' in parents and trashed=false and name='run_{slot}.tsv'"
-            tr = svc.files().list(q=tsq, fields="files(id,name)").execute()
-            if not tr.get('files'): 
-                # se não existe, pula job
+            candidates = [f"run_{slot}_{lang}.tsv", f"run_{slot}.tsv"]
+            found = None
+            for name in candidates:
+                rs = list_by_name(svc, scripts_id, name)
+                if rs:
+                    found = rs[0]['id']; break
+            if not found:
+                # sem TSV correspondente, pula job
                 continue
+
             tsv_local = os.path.join(tmpdir, f'run_{slot}.tsv')
-            req = svc.files().get_media(fileId=tr['files'][0]['id'])
+            req = svc.files().get_media(fileId=found)
             with open(tsv_local,'wb') as out:
                 dl = MediaIoBaseDownload(out, req); done=False
                 while not done:
@@ -263,27 +272,27 @@ def run():
             build_tts(narr_txt, narr_wav)
             narr_len = seconds_of(narr_wav)
 
-            # imagens
-            base_imgs = list_all_local(svc, img_m if 'maria' in slot else img_j, ('.jpg','.jpeg','.png'), limit=20)
+            # imagens base
+            base_folder = img_m if 'maria' in slot else img_j
+            base_imgs = list_all_local(svc, base_folder, ('.jpg','.jpeg','.png'), limit=20)
             if len(base_imgs)<2:
-                extra = list_all_local(svc, brolls, ('.jpg','.jpeg','.png'), limit=10)
-                base_imgs += extra
-            # vídeo (slideshow) no tamanho da narração, mas garantimos 480s ao final
+                base_imgs += list_all_local(svc, brolls, ('.jpg','.jpeg','.png'), limit=10)
+
+            # vídeo (slideshow)
             vid_mp4 = os.path.join(tmpdir,'vid.mp4')
-            base_dur = min(max(narr_len, 60.0), TARGET_SEC)  # pelo menos 60s para efeito
+            base_dur = min(max(narr_len, 60.0), TARGET_SEC)  # >=60s
             build_slideshow(base_imgs, base_dur, vid_mp4)
 
             # música
             music_src = pick_any(svc, mus_am if (slot=='maria_v2' and policy=='ave_maria') else mus_bg, ('.mp3','.wav','.m4a'))
             if not music_src:
-                # sem música, duplica apenas a voz no tempo alvo
                 bg_mix = os.path.join(tmpdir,'mix.wav')
                 run(f'ffmpeg -y -i "{narr_wav}" -t {TARGET_SEC} -af "apad=pad_dur={TARGET_SEC}" "{bg_mix}"')
             else:
                 bg_mix = os.path.join(tmpdir,'mix.wav')
                 mix_av(narr_wav, music_src, TARGET_SEC, bg_mix)
 
-            # mux final (corta/estende vídeo para 480s)
+            # mux final (trava 480s)
             final_mp4 = os.path.join(tmpdir, f'{slot}_{lang}_{datetime.utcnow().strftime("%Y%m%d")}.mp4')
             run(f'ffmpeg -y -stream_loop -1 -i "{vid_mp4}" -i "{bg_mix}" -shortest -t {TARGET_SEC} '
                 f'-map 0:v:0 -map 1:a:0 -c:v libx264 -preset veryfast -crf 20 -c:a aac -b:a 160k -pix_fmt yuv420p "{final_mp4}"')
@@ -293,8 +302,8 @@ def run():
             make_thumb(base_imgs[0], title, thumb_jpg)
 
             # upload
-            out_folder = {'pt':out_pt,'en':out_en,'es':out_es,'pl':out_pl}[lang]
-            th_folder  = {'pt':th_pt,'en':th_en,'es':th_es,'pl':th_pl}[lang]
+            out_folder = {'pt':out_pt,'en':out_en,'es':out_es,'pl':out_pl}.get(lang, out_pt)
+            th_folder  = {'pt':th_pt,'en':th_en,'es':th_es,'pl':th_pl}.get(lang, th_pt)
             upload_file(svc, out_folder, final_mp4, os.path.basename(final_mp4), 'video/mp4')
             upload_file(svc, th_folder,  thumb_jpg, f'thumb_{slot}_{datetime.utcnow().strftime("%Y%m%d")}.jpg', 'image/jpeg')
 
