@@ -108,21 +108,24 @@ def list_all_local(svc, folder_id, exts, limit=50):
         paths.append(tmp)
     return paths
 
-# -------------------- MEDIA HELPERS -------------
-def run(cmd):
-    cp=sp.run(cmd, shell=True, stdout=sp.PIPE, stderr=sp.STDOUT, text=True)
-    if cp.returncode!=0: raise RuntimeError(cp.stdout)
+# -------------------- SHELL HELPER -------------
+def sh(cmd: str) -> str:
+    """Executa comando de shell e retorna stdout; lança erro se RC!=0."""
+    cp = sp.run(cmd, shell=True, stdout=sp.PIPE, stderr=sp.STDOUT, text=True)
+    if cp.returncode != 0:
+        raise RuntimeError(cp.stdout)
     return cp.stdout
 
+# -------------------- MEDIA HELPERS -------------
 def seconds_of(audio_path):
-    out=run(f'ffprobe -v error -show_entries format=duration -of default=nw=1:nk=1 "{audio_path}"')
+    out = sh(f'ffprobe -v error -show_entries format=duration -of default=nw=1:nk=1 "{audio_path}"')
     return float(out.strip())
 
 def build_tts(text, out_wav):
     # gTTS -> mp3 -> wav; leve ajuste de pitch
     tmp_mp3 = out_wav.replace('.wav','.mp3')
     gTTS(text=text, lang='pt', slow=False).save(tmp_mp3)
-    run(f'ffmpeg -y -i "{tmp_mp3}" -filter:a "asetrate=44100*0.89,aresample=44100,atempo=1.12" "{out_wav}"')
+    sh(f'ffmpeg -y -i "{tmp_mp3}" -filter:a "asetrate=44100*0.89,aresample=44100,atempo=1.12" "{out_wav}"')
     os.remove(tmp_mp3)
 
 def build_slideshow(imgs, dur, out_mp4):
@@ -142,14 +145,14 @@ def build_slideshow(imgs, dur, out_mp4):
     chain = ';'.join([prep]+xfade_chain)
     final = f'-map [v{len(imgs)-1}] -r {FPS} -pix_fmt yuv420p -movflags +faststart -vf scale={W}:{H}'
     cmd = f'ffmpeg -y {inputs} -filter_complex "{chain}" -t {dur:.3f} {final} "{out_mp4}"'
-    run(cmd)
+    sh(cmd)
 
 def mix_av(narr_wav, music_wav, target_sec, out_wav):
     # loop música e mix baixo (-18dB)
-    run(f'ffmpeg -y -stream_loop -1 -i "{music_wav}" -i "{narr_wav}" '
-        f'-filter_complex "[0:a]volume=0.18,aloop=loop=-1:size=2e6[a0];'
-        f'[a0]atrim=0:{target_sec}[m];[1:a]atrim=0:{target_sec}[v];'
-        f'[v][m]amix=inputs=2:normalize=0[a]" -map "[a]" -t {target_sec} "{out_wav}"')
+    sh(f'ffmpeg -y -stream_loop -1 -i "{music_wav}" -i "{narr_wav}" '
+       f'-filter_complex "[0:a]volume=0.18,aloop=loop=-1:size=2e6[a0];'
+       f'[a0]atrim=0:{target_sec}[m];[1:a]atrim=0:{target_sec}[v];'
+       f'[v][m]amix=inputs=2:normalize=0[a]" -map "[a]" -t {target_sec} "{out_wav}"')
 
 def make_thumb(base_img, title, out_png):
     img = Image.open(base_img).convert('RGB').resize((W,H))
@@ -347,15 +350,15 @@ def run():
             music_src = pick_any(svc, mus_am if (slot=='maria_v2' and policy=='ave_maria') else mus_bg, ('.mp3','.wav','.m4a'))
             if not music_src:
                 bg_mix = os.path.join(tmpdir,'mix.wav')
-                run(f'ffmpeg -y -i "{narr_wav}" -t {TARGET_SEC} -af "apad=pad_dur={TARGET_SEC}" "{bg_mix}"')
+                sh(f'ffmpeg -y -i "{narr_wav}" -t {TARGET_SEC} -af "apad=pad_dur={TARGET_SEC}" "{bg_mix}"')
             else:
                 bg_mix = os.path.join(tmpdir,'mix.wav')
                 mix_av(narr_wav, music_src, TARGET_SEC, bg_mix)
 
             # mux final (trava 480s)
             final_mp4 = os.path.join(tmpdir, f'{slot}_{lang}_{datetime.utcnow().strftime("%Y%m%d")}.mp4')
-            run(f'ffmpeg -y -stream_loop -1 -i "{vid_mp4}" -i "{bg_mix}" -shortest -t {TARGET_SEC} '
-                f'-map 0:v:0 -map 1:a:0 -c:v libx264 -preset veryfast -crf 20 -c:a aac -b:a 160k -pix_fmt yuv420p "{final_mp4}"')
+            sh(f'ffmpeg -y -stream_loop -1 -i "{vid_mp4}" -i "{bg_mix}" -shortest -t {TARGET_SEC} '
+               f'-map 0:v:0 -map 1:a:0 -c:v libx264 -preset veryfast -crf 20 -c:a aac -b:a 160k -pix_fmt yuv420p "{final_mp4}"')
 
             # thumbnail
             thumb_jpg = os.path.join(tmpdir, 'thumb.jpg')
