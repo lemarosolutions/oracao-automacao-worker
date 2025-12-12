@@ -15,9 +15,16 @@ FPS = 30
 W, H = 1920, 1080
 ZOOM = 1.08          # leve Ken Burns
 XFAD = 0.6           # crossfade entre imagens
-SAY_TYPES = {'exame','suplica','verso','intercessao','agradecimento','encerramento','cta','texto','mensagem'}
 
-# Escopos CORRETOS – permite ler QUALQUER arquivo do Drive + Sheets (evita 403 appNotAuthorizedToFile)
+# Tipos aceitos do template (cobre variações)
+SAY_TYPES = {
+    'abertura','exame','suplica','súplica','verso','salmo',
+    'meditacao','meditação','meditacoes','meditações',
+    'intercessao','intercessão','agradecimento','encerramento',
+    'cta','texto','mensagem'
+}
+
+# Escopos corretos – ler QUALQUER arquivo do Drive + Sheets (evita 403)
 SCOPES = [
     "https://www.googleapis.com/auth/drive.readonly",
     "https://www.googleapis.com/auth/drive.metadata.readonly",
@@ -175,31 +182,85 @@ def clean_line(s):
     return s.strip()
 
 def load_tsv(path):
-    rows=[]
-    with open(path,'r',encoding='utf-8') as f:
+    """
+    Aceita:
+      - 4 colunas: run, ord, tipo, txt
+      - 3 colunas: passo_ordem, passo_tipo, conteudo_pt
+    Ignora cabeçalho automaticamente.
+    """
+    rows = []
+    with open(path, 'r', encoding='utf-8') as f:
         for ln in f:
-            parts=ln.rstrip('\n').split('\t')
-            if len(parts)>=4:
-                rows.append({'run':parts[0],'ord':int(parts[1]),'tipo':parts[2].lower().strip(),'txt':parts[3]})
-    rows.sort(key=lambda x:x['ord'])
+            ln = ln.rstrip('\n')
+            if not ln:
+                continue
+            parts = ln.split('\t')
+
+            # detectar e pular header
+            head0 = parts[0].strip().lower()
+            if head0 in ('run','passo_ordem'):
+                continue
+
+            if len(parts) >= 4:
+                # formato antigo
+                run_id = parts[0].strip()
+                try:
+                    ord_ = int(parts[1])
+                except:
+                    continue
+                tipo = parts[2].strip().lower()
+                txt  = parts[3].strip()
+            elif len(parts) >= 3:
+                # formato atual
+                run_id = ''
+                try:
+                    ord_ = int(parts[0])
+                except:
+                    continue
+                tipo = parts[1].strip().lower()
+                txt  = parts[2].strip()
+            else:
+                continue
+
+            rows.append({'run': run_id, 'ord': ord_, 'tipo': tipo, 'txt': txt})
+
+    rows.sort(key=lambda x: x['ord'])
     return rows
 
 def narration_from_rows(rows):
-    texts=[]
-    policy='bg_random'
+    """
+    Extrai o texto de narração e a política de música.
+    Tem fallback robusto para não deixar TTS vazio.
+    """
+    texts = []
+    policy = 'bg_random'
+
     for r in rows:
-        t=r['tipo']
-        if t=='musica_policy':
+        t = r['tipo']
+        if t == 'musica_policy':
             policy = clean_line(r['txt']).lower()
             continue
         if t in SAY_TYPES:
-            val=clean_line(r['txt'])
-            if val: texts.append(val)
-    base=' '.join(texts)
-    words=base.split()
-    if len(words)<700:
-        rep = math.ceil(900/ max(1,len(words)))
-        base = (' ' + (' '.join(texts) + ' ')).join(['']*rep).strip()
+            val = clean_line(r['txt'])
+            if val:
+                texts.append(val)
+
+    # Fallback: se não achou nada pelos tipos, junta todo o texto válido
+    if not texts:
+        texts = [clean_line(r['txt']) for r in rows if clean_line(r['txt'])]
+
+    base = ' '.join(texts).strip()
+
+    # Se ainda vazio, garanta um texto mínimo para não quebrar o TTS
+    if not base:
+        base = "Oração de paz e esperança. Que Deus abençoe o seu dia."
+
+    # Booster para chegar perto de 480s quando o texto é curto
+    words = base.split()
+    if len(words) < 700:
+        rep = max(1, math.ceil(900 / max(1, len(words))))
+        base = (' ' + (base + ' ')).join([''] * rep).strip()
+
     return base, policy
 
 # -------------------- MAIN ----------------------
