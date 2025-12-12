@@ -140,7 +140,10 @@ def build_slideshow(imgs, dur, out_mp4):
         a = f'v{i}' if i>0 else '0:v'
         b = f'{i+1}:v'
         out = f'v{i+1}'
-        xfade_chain.append(f'[{a}][{b}]xfade=transition=crossfade:duration={XFAD}:offset={(i+1)*per + i*XFAD:.3f}[{out}]')
+        # 'fade' é suportado amplamente; 'crossfade' quebra nesta build
+        xfade_chain.append(
+            f'[{a}][{b}]xfade=transition=fade:duration={XFAD}:offset={(i+1)*per + i*XFAD:.3f}[{out}]'
+        )
     prep = ';'.join([f'[{i}:v]{zoom},format=yuv420p[v{i}]' for i in range(len(imgs))])
     chain = ';'.join([prep]+xfade_chain)
     final = f'-map [v{len(imgs)-1}] -r {FPS} -pix_fmt yuv420p -movflags +faststart -vf scale={W}:{H}'
