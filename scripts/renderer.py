@@ -81,7 +81,6 @@ def pick_any(svc, folder_id, exts):
     cand=[f for f in files if any(f['name'].lower().endswith(e) for e in exts)]
     if not cand: return None
     f=random.choice(cand)
-    # download to tmp
     req = svc.files().get_media(fileId=f['id'])
     fd,tmp = tempfile.mkstemp(suffix='_'+f['name']); os.close(fd)
     with open(tmp,'wb') as out:
@@ -110,7 +109,6 @@ def list_all_local(svc, folder_id, exts, limit=50):
 
 # -------------------- SHELL HELPER -------------
 def sh(cmd: str) -> str:
-    """Executa comando de shell e retorna stdout; lança erro se RC!=0."""
     cp = sp.run(cmd, shell=True, stdout=sp.PIPE, stderr=sp.STDOUT, text=True)
     if cp.returncode != 0:
         raise RuntimeError(cp.stdout)
@@ -122,7 +120,6 @@ def seconds_of(audio_path):
     return float(out.strip())
 
 def build_tts(text, out_wav):
-    # gTTS -> mp3 -> wav; leve ajuste de pitch
     tmp_mp3 = out_wav.replace('.wav','.mp3')
     gTTS(text=text, lang='pt', slow=False).save(tmp_mp3)
     sh(f'ffmpeg -y -i "{tmp_mp3}" -filter:a "asetrate=44100*0.89,aresample=44100,atempo=1.12" "{out_wav}"')
@@ -140,18 +137,17 @@ def build_slideshow(imgs, dur, out_mp4):
         a = f'v{i}' if i>0 else '0:v'
         b = f'{i+1}:v'
         out = f'v{i+1}'
-        # 'fade' é suportado amplamente; 'crossfade' quebra nesta build
         xfade_chain.append(
             f'[{a}][{b}]xfade=transition=fade:duration={XFAD}:offset={(i+1)*per + i*XFAD:.3f}[{out}]'
         )
     prep = ';'.join([f'[{i}:v]{zoom},format=yuv420p[v{i}]' for i in range(len(imgs))])
     chain = ';'.join([prep]+xfade_chain)
-    final = f'-map [v{len(imgs)-1}] -r {FPS} -pix_fmt yuv420p -movflags +faststart -vf scale={W}:{H}'
+    # >>> Removido -vf para não conflitar com filter_complex <<<
+    final = f'-map [v{len(imgs)-1}] -r {FPS} -pix_fmt yuv420p -movflags +faststart'
     cmd = f'ffmpeg -y {inputs} -filter_complex "{chain}" -t {dur:.3f} {final} "{out_mp4}"'
     sh(cmd)
 
 def mix_av(narr_wav, music_wav, target_sec, out_wav):
-    # loop música e mix baixo (-18dB)
     sh(f'ffmpeg -y -stream_loop -1 -i "{music_wav}" -i "{narr_wav}" '
        f'-filter_complex "[0:a]volume=0.18,aloop=loop=-1:size=2e6[a0];'
        f'[a0]atrim=0:{target_sec}[m];[1:a]atrim=0:{target_sec}[v];'
@@ -184,7 +180,7 @@ def make_thumb(base_img, title, out_png):
 
 # -------------------- TSV PARSE -----------------
 def clean_line(s):
-    s = re.sub(r'\[.*?\]','', str(s))  # remove [VIDEO]/[VOZ] etc
+    s = re.sub(r'\[.*?\]','', str(s))
     return s.strip()
 
 def load_tsv(path):
@@ -202,13 +198,11 @@ def load_tsv(path):
                 continue
             parts = ln.split('\t')
 
-            # detectar e pular header
             head0 = parts[0].strip().lower()
             if head0 in ('run','passo_ordem'):
                 continue
 
             if len(parts) >= 4:
-                # formato antigo
                 run_id = parts[0].strip()
                 try:
                     ord_ = int(parts[1])
@@ -217,7 +211,6 @@ def load_tsv(path):
                 tipo = parts[2].strip().lower()
                 txt  = parts[3].strip()
             elif len(parts) >= 3:
-                # formato atual
                 run_id = ''
                 try:
                     ord_ = int(parts[0])
@@ -234,13 +227,8 @@ def load_tsv(path):
     return rows
 
 def narration_from_rows(rows):
-    """
-    Extrai o texto de narração e a política de música.
-    Tem fallback robusto para não deixar TTS vazio.
-    """
     texts = []
     policy = 'bg_random'
-
     for r in rows:
         t = r['tipo']
         if t == 'musica_policy':
@@ -251,17 +239,13 @@ def narration_from_rows(rows):
             if val:
                 texts.append(val)
 
-    # Fallback: se não achou nada pelos tipos, junta todo o texto válido
     if not texts:
         texts = [clean_line(r['txt']) for r in rows if clean_line(r['txt'])]
 
     base = ' '.join(texts).strip()
-
-    # Se ainda vazio, garanta um texto mínimo para não quebrar o TTS
     if not base:
         base = "Oração de paz e esperança. Que Deus abençoe o seu dia."
 
-    # Booster para chegar perto de 480s quando o texto é curto
     words = base.split()
     if len(words) < 700:
         rep = max(1, math.ceil(900 / max(1, len(words))))
@@ -274,7 +258,6 @@ def run():
     svc = svc_from_oauth()
     ROOT = os.getenv('DRIVE_ROOT_FOLDER_ID')
 
-    # pastas
     cfg_id  = ensure_folder(svc, ROOT, '00_config')
     out_pt  = ensure_folder(svc, ROOT, '03_outputs_videos_pt')
     out_en  = ensure_folder(svc, ROOT, '03_outputs_videos_en')
@@ -290,7 +273,6 @@ def run():
     mus_bg  = ensure_folder(svc, ROOT, '01_assets_musicas')
     mus_am  = ensure_folder(svc, ROOT, '01_assets_musicas_ave_maria')
 
-    # último work_order (compatível com lista direta OU {"orders":[...]})
     q = f"'{cfg_id}' in parents and trashed=false and name contains 'work_orders_'"
     r = svc.files().list(q=q, orderBy='modifiedTime desc', pageSize=1,
                          fields="files(id,name)").execute()
@@ -310,7 +292,6 @@ def run():
             title = job.get('title','')
             policy = (job.get('musica_policy') or job.get('policy') or 'bg_random').lower()
 
-            # pega TSV run_<slot>_{lang}.tsv OU run_<slot>.tsv (fallback)
             scripts_id = ensure_folder(svc, ROOT, '02_scripts_autogerados')
             candidates = [f"run_{slot}_{lang}.tsv", f"run_{slot}.tsv"]
             found = None
@@ -319,7 +300,6 @@ def run():
                 if rs:
                     found = rs[0]['id']; break
             if not found:
-                # sem TSV correspondente, pula job
                 continue
 
             tsv_local = os.path.join(tmpdir, f'run_{slot}.tsv')
@@ -333,23 +313,19 @@ def run():
             narr_txt, pol = narration_from_rows(rows)
             if policy=='bg_random': policy = pol
 
-            # TTS
             narr_wav = os.path.join(tmpdir,'narr.wav')
             build_tts(narr_txt, narr_wav)
             narr_len = seconds_of(narr_wav)
 
-            # imagens base
             base_folder = img_m if 'maria' in slot else img_j
             base_imgs = list_all_local(svc, base_folder, ('.jpg','.jpeg','.png'), limit=20)
             if len(base_imgs)<2:
                 base_imgs += list_all_local(svc, brolls, ('.jpg','.jpeg','.png'), limit=10)
 
-            # vídeo (slideshow)
             vid_mp4 = os.path.join(tmpdir,'vid.mp4')
-            base_dur = min(max(narr_len, 60.0), TARGET_SEC)  # >=60s
+            base_dur = min(max(narr_len, 60.0), TARGET_SEC)
             build_slideshow(base_imgs, base_dur, vid_mp4)
 
-            # música
             music_src = pick_any(svc, mus_am if (slot=='maria_v2' and policy=='ave_maria') else mus_bg, ('.mp3','.wav','.m4a'))
             if not music_src:
                 bg_mix = os.path.join(tmpdir,'mix.wav')
@@ -358,22 +334,18 @@ def run():
                 bg_mix = os.path.join(tmpdir,'mix.wav')
                 mix_av(narr_wav, music_src, TARGET_SEC, bg_mix)
 
-            # mux final (trava 480s)
             final_mp4 = os.path.join(tmpdir, f'{slot}_{lang}_{datetime.utcnow().strftime("%Y%m%d")}.mp4')
             sh(f'ffmpeg -y -stream_loop -1 -i "{vid_mp4}" -i "{bg_mix}" -shortest -t {TARGET_SEC} '
                f'-map 0:v:0 -map 1:a:0 -c:v libx264 -preset veryfast -crf 20 -c:a aac -b:a 160k -pix_fmt yuv420p "{final_mp4}"')
 
-            # thumbnail
             thumb_jpg = os.path.join(tmpdir, 'thumb.jpg')
             make_thumb(base_imgs[0], title, thumb_jpg)
 
-            # upload
             out_folder = {'pt':out_pt,'en':out_en,'es':out_es,'pl':out_pl}.get(lang, out_pt)
             th_folder  = {'pt':th_pt,'en':th_en,'es':th_es,'pl':th_pl}.get(lang, th_pt)
             upload_file(svc, out_folder, final_mp4, os.path.basename(final_mp4), 'video/mp4')
             upload_file(svc, th_folder,  thumb_jpg, f'thumb_{slot}_{datetime.utcnow().strftime("%Y%m%d")}.jpg', 'image/jpeg')
 
-        # log curtinho no Drive/05_logs
         logs_id = ensure_folder(svc, ROOT, '05_logs')
         logname = f'log_renderer_{datetime.utcnow().strftime("%Y%m%d-%H%M%S")}.txt'
         txt = f'UTC:{datetime.utcnow().isoformat()} status:OK steps:render_v2 completed'
