@@ -1,9 +1,19 @@
 name: render
 
 on:
-  workflow_dispatch: {}
-  # schedule:
-  #   - cron: "41 3 * * *"  # (opcional) deixe comentado até finalizar testes
+  workflow_dispatch:
+  schedule:
+    # PT — Brasil (America/Sao_Paulo) → 00:41 BRT (UTC-3)
+    - cron: "41 3 * * *"
+
+    # EN — EUA (America/New_York) → 00:41 ET (UTC-5)
+    - cron: "41 5 * * *"
+
+    # ES — México (America/Mexico_City) → 00:41 CT (UTC-6)
+    - cron: "41 6 * * *"
+
+    # PL — Polônia (Europe/Warsaw) → 00:41 CET (UTC+1) = 23:41 UTC (dia anterior)
+    - cron: "41 23 * * *"
 
 jobs:
   render:
@@ -25,11 +35,11 @@ jobs:
         with:
           python-version: "3.11"
 
-      # FFmpeg garantido no PATH (evita falhas de render/mixagem)
+      # FFmpeg garantido no PATH
       - name: Setup FFmpeg
         uses: FedericoCarboni/setup-ffmpeg@v2
 
-      # Fonts básicas para gerar SRT/thumbnail sem caracteres quebrados
+      # Fonts básicas
       - name: Install system fonts
         run: |
           sudo apt-get update
@@ -42,9 +52,26 @@ jobs:
             google-api-python-client google-auth google-auth-oauthlib google-auth-httplib2 \
             edge-tts gTTS pydub srt pillow
 
-      # Renderer: o script deve ler SHEET_ID/DRIVE_ROOT_FOLDER_ID e secrets via ENV.
-      # Se seu renderer recebe flags diferentes, ajustamos depois.
+      # Render PT
       - name: Run renderer (PT)
         run: |
           set -e
           python scripts/renderer.py --lang pt --duration 480 --tts-per-sentence 1 --ducking -10
+
+      # Render EN
+      - name: Run renderer (EN)
+        run: |
+          set -e
+          python scripts/renderer.py --lang en --duration 480 --tts-per-sentence 1 --ducking -10
+
+      # Render ES
+      - name: Run renderer (ES)
+        run: |
+          set -e
+          python scripts/renderer.py --lang es --duration 480 --tts-per-sentence 1 --ducking -10
+
+      # Render PL
+      - name: Run renderer (PL)
+        run: |
+          set -e
+          python scripts/renderer.py --lang pl --duration 480 --tts-per-sentence 1 --ducking -10
