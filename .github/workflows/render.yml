@@ -1,30 +1,27 @@
 name: render
 
 on:
-  workflow_dispatch:
+  workflow_dispatch: {}
   schedule:
-    # PT — Brasil (America/Sao_Paulo) → 00:41 BRT (UTC-3)
-    - cron: "41 3 * * *"
+    # Cron frequente (UTC): a cada 30 minutos
+    # O renderer decide o que renderizar com base em publishAt (janela HORIZON_HOURS)
+    - cron: "*/30 * * * *"
 
-    # EN — EUA (America/New_York) → 00:41 ET (UTC-5)
-    - cron: "41 5 * * *"
-
-    # ES — México (America/Mexico_City) → 00:41 CT (UTC-6)
-    - cron: "41 6 * * *"
-
-    # PL — Polônia (Europe/Warsaw) → 00:41 CET (UTC+1) = 23:41 UTC (dia anterior)
-    - cron: "41 23 * * *"
+concurrency:
+  group: render-queue
+  cancel-in-progress: false
 
 jobs:
   render:
     runs-on: ubuntu-latest
 
     env:
-      DRIVE_ROOT_FOLDER_ID: ${{ secrets.DRIVE_ROOT_FOLDER_ID }}
+      DRIVE_ROOT_FOLDER_ID:   ${{ secrets.DRIVE_ROOT_FOLDER_ID }}
       SHEET_ID:              ${{ secrets.SHEET_ID }}
-      OAUTH_CLIENT_ID:       ${{ secrets.OAUTH_CLIENT_ID }}
-      OAUTH_CLIENT_SECRET:   ${{ secrets.OAUTH_CLIENT_SECRET }}
-      OAUTH_REFRESH_TOKEN:   ${{ secrets.OAUTH_REFRESH_TOKEN }}
+      SERVICE_ACCOUNT_JSON:  ${{ secrets.SERVICE_ACCOUNT_JSON }}
+
+      # Janela de produção: renderiza apenas jobs com publishAt dentro das próximas 12h
+      HORIZON_HOURS: "12"
 
     steps:
       - name: Checkout
@@ -35,11 +32,9 @@ jobs:
         with:
           python-version: "3.11"
 
-      # FFmpeg garantido no PATH
       - name: Setup FFmpeg
         uses: FedericoCarboni/setup-ffmpeg@v2
 
-      # Fonts básicas
       - name: Install system fonts
         run: |
           sudo apt-get update
@@ -52,26 +47,7 @@ jobs:
             google-api-python-client google-auth google-auth-oauthlib google-auth-httplib2 \
             edge-tts gTTS pydub srt pillow
 
-      # Render PT
-      - name: Run renderer (PT)
+      - name: Run renderer (queue-aware)
         run: |
           set -e
-          python scripts/renderer.py --lang pt --duration 480 --tts-per-sentence 1 --ducking -10
-
-      # Render EN
-      - name: Run renderer (EN)
-        run: |
-          set -e
-          python scripts/renderer.py --lang en --duration 480 --tts-per-sentence 1 --ducking -10
-
-      # Render ES
-      - name: Run renderer (ES)
-        run: |
-          set -e
-          python scripts/renderer.py --lang es --duration 480 --tts-per-sentence 1 --ducking -10
-
-      # Render PL
-      - name: Run renderer (PL)
-        run: |
-          set -e
-          python scripts/renderer.py --lang pl --duration 480 --tts-per-sentence 1 --ducking -10
+          python scripts/renderer.py --duration 480
