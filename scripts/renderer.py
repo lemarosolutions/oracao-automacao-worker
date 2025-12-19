@@ -1,10 +1,9 @@
 # scripts/renderer.py
 # Renderer QUEUE-AWARE + IDEMPOTENTE + MOVIMENTO SEGURO
-# - Prioriza SERVICE_ACCOUNT_JSON (sem expiração)
-# - Fallback OAuth legado (se existir)
-# - Processa apenas jobs com publishAt dentro da janela HORIZON_HOURS
-# - Não duplica: pula se já existir output com job_id
-# - Slideshow com "movimento" via crop oscilante (sem xfade/zoompan complexos)
+# - Prioriza SERVICE_ACCOUNT_JSON
+# - Processa publishAt dentro de HORIZON_HOURS
+# - Sem duplicação por job_id
+# - Slideshow com movimento seguro: scale+crop com oscilação (sem xfade/zoompan)
 
 import os, io, json, random, tempfile, shutil, re, math, argparse
 from datetime import datetime, timezone, timedelta
@@ -18,7 +17,6 @@ from google.oauth2 import service_account
 
 from PIL import Image, ImageDraw, ImageFont
 
-# -------------------- CONFIG --------------------
 TARGET_SEC_DEFAULT = 480
 FPS = 30
 W, H = 1920, 1080
@@ -40,7 +38,6 @@ SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets.readonly",
 ]
 
-# -------------------- SHELL ---------------------
 def sh(cmd: str) -> str:
     cp = sp.run(cmd, shell=True, stdout=sp.PIPE, stderr=sp.STDOUT, text=True)
     if cp.returncode != 0:
@@ -75,24 +72,18 @@ def parse_iso_utc(s: str):
     except Exception:
         return None
 
-# -------------------- AUTH ----------------------
 def build_drive_service():
-    # PRIORIDADE: Service Account (estável, sem expiração)
     sa_json = os.getenv("SERVICE_ACCOUNT_JSON", "").strip()
     if sa_json:
         info = json.loads(sa_json)
         creds = service_account.Credentials.from_service_account_info(info, scopes=SCOPES)
         return build("drive", "v3", credentials=creds)
 
-    # Fallback: OAuth legado (se existir)
     client_id = os.getenv("OAUTH_CLIENT_ID", "").strip()
     client_secret = os.getenv("OAUTH_CLIENT_SECRET", "").strip()
     refresh_token = os.getenv("OAUTH_REFRESH_TOKEN", "").strip()
     if not (client_id and client_secret and refresh_token):
-        raise RuntimeError(
-            "Credenciais ausentes. Defina SERVICE_ACCOUNT_JSON (preferencial). "
-            "Ou então forneça OAUTH_CLIENT_ID/OAUTH_CLIENT_SECRET/OAUTH_REFRESH_TOKEN."
-        )
+        raise RuntimeError("Defina SERVICE_ACCOUNT_JSON (preferencial) ou OAuth legado completo.")
 
     creds = Credentials(
         None,
@@ -105,7 +96,6 @@ def build_drive_service():
     creds.refresh(Request())
     return build("drive", "v3", credentials=creds)
 
-# -------------------- DRIVE HELPERS -------------
 def list_by_name(svc, parent_id: str, name: str):
     q = f"'{parent_id}' in parents and trashed=false and name='{name}'"
     r = svc.files().list(q=q, fields="files(id,name)").execute()
@@ -166,60 +156,18 @@ def pick_random_local(svc, folder_id: str, exts, avoid_names=None):
     download_binary(svc, f["id"], tmp)
     return tmp, f["name"]
 
-def download_many_images(svc, folder_id: str, limit: int, avoid_names=None):
-    avoid_names = set([n.lower() for n in (avoid_names or [])])
+def download_many_images(svc, folder_id: str, limit: int):
     files = list_files_in_folder(svc, folder_id)
     imgs = [f for f in files if any(f["name"].lower().endswith(e) for e in IMG_EXTS)]
     random.shuffle(imgs)
-
-    chosen = [f for f in imgs if f["name"].lower() not in avoid_names][:limit]
-    if len(chosen) < max(1, min(limit, 5)):
-        chosen += [f for f in imgs if f not in chosen][: (limit - len(chosen))]
-
+    imgs = imgs[:limit] if limit else imgs
     paths, names = [], []
-    for f in chosen:
+    for f in imgs:
         fd, tmp = tempfile.mkstemp(suffix="_" + f["name"]); os.close(fd)
         download_binary(svc, f["id"], tmp)
         paths.append(tmp); names.append(f["name"])
     return paths, names
 
-# -------------------- STATE ---------------------
-def load_state(svc, cfg_id: str):
-    r = list_by_name(svc, cfg_id, "state.json")
-    if not r:
-        return {"recent_images": {}, "recent_music": {}}, None
-    fid = r[0]["id"]
-    try:
-        data = json.loads(download_text(svc, fid))
-        if not isinstance(data, dict):
-            data = {"recent_images": {}, "recent_music": {}}
-        data.setdefault("recent_images", {})
-        data.setdefault("recent_music", {})
-        return data, fid
-    except:
-        return {"recent_images": {}, "recent_music": {}}, fid
-
-def save_state(svc, cfg_id: str, state: dict, existing_file_id):
-    tmp = tempfile.mkstemp(suffix="_state.json")[1]
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(state, f, ensure_ascii=False, indent=2)
-
-    if existing_file_id:
-        media = MediaIoBaseUpload(open(tmp, "rb"), mimetype="application/json", resumable=True)
-        svc.files().update(fileId=existing_file_id, media_body=media).execute()
-    else:
-        upload_file(svc, cfg_id, tmp, "state.json", "application/json")
-    os.remove(tmp)
-
-def push_recent(lst: list, item: str, max_len: int):
-    if not item:
-        return lst
-    item_l = item.lower()
-    lst = [x for x in lst if x.lower() != item_l]
-    lst.insert(0, item)
-    return lst[:max_len]
-
-# -------------------- TSV -----------------------
 def load_tsv_rows(tsv_path: str):
     rows = []
     with open(tsv_path, "r", encoding="utf-8") as f:
@@ -231,22 +179,14 @@ def load_tsv_rows(tsv_path: str):
             head0 = parts[0].strip().lower()
             if head0 in ("run", "passo_ordem"):
                 continue
-
             if len(parts) >= 4:
                 try: ord_ = int(parts[1])
                 except: continue
                 tipo = to_str(parts[2]).lower()
                 txt  = to_str(parts[3])
-            elif len(parts) >= 3:
-                try: ord_ = int(parts[0])
-                except: continue
-                tipo = to_str(parts[1]).lower()
-                txt  = to_str(parts[2])
             else:
                 continue
-
             rows.append({"ord": ord_, "tipo": tipo, "txt": txt})
-
     rows.sort(key=lambda x: x["ord"])
     return rows
 
@@ -254,7 +194,6 @@ def narration_from_rows(rows):
     texts = []
     policy = "bg_random"
     faixa_ave_maria = ""
-
     for r in rows:
         t = r["tipo"]
         if t == "musica_policy":
@@ -268,25 +207,18 @@ def narration_from_rows(rows):
             if val:
                 texts.append(val)
 
-    base = " ".join(texts).strip()
-    if not base:
-        base = "Oração de paz e esperança. Que Deus abençoe o seu dia."
-
+    base = " ".join(texts).strip() or "Oração de paz e esperança. Que Deus abençoe o seu dia."
     words = base.split()
     if len(words) < 700:
         rep = max(1, math.ceil(900 / max(1, len(words))))
         base = (" " + (base + " ")).join([""] * rep).strip()
-
     return base, policy, faixa_ave_maria
 
-# -------------------- THUMB ---------------------
 def make_thumb(base_img, title, out_jpg):
     img = Image.open(base_img).convert("RGB").resize((W, H))
     draw = ImageDraw.Draw(img)
-
     overlay = Image.new("RGBA", img.size, (0, 0, 0, 140))
     img = Image.alpha_composite(img.convert("RGBA"), overlay)
-
     try:
         font = ImageFont.truetype("DejaVuSans-Bold.ttf", 88)
     except:
@@ -299,13 +231,10 @@ def make_thumb(base_img, title, out_jpg):
         if len(test) <= 22:
             line = test
         else:
-            if line:
-                lines.append(line)
+            if line: lines.append(line)
             line = w
-        if len(lines) >= 3:
-            break
-    if line and len(lines) < 3:
-        lines.append(line)
+        if len(lines) >= 3: break
+    if line and len(lines) < 3: lines.append(line)
 
     y = H // 2 - (len(lines) * 90) // 2
     for ln in lines:
@@ -316,11 +245,8 @@ def make_thumb(base_img, title, out_jpg):
 
     img.convert("RGB").save(out_jpg, "JPEG", quality=92)
 
-# -------------------- TTS -----------------------
 def build_tts_wav(text: str, out_wav: str, lang: str):
     text = text.replace('"', "")
-
-    # edge-tts se disponível
     try:
         sh("python -c \"import edge_tts\"")
         voice_map = {
@@ -338,19 +264,16 @@ def build_tts_wav(text: str, out_wav: str, lang: str):
     except Exception:
         pass
 
-    # gTTS fallback
     from gtts import gTTS
     tmp_mp3 = out_wav.replace(".wav", ".mp3")
     gTTS(text=text, lang=("pt" if lang == "pt" else lang), slow=False).save(tmp_mp3)
     sh(f'ffmpeg -y -i "{tmp_mp3}" -ac 1 -ar 44100 "{out_wav}"')
     os.remove(tmp_mp3)
 
-# -------------------- AUDIO MIX -----------------
-def mix_voice_and_music(voice_wav: str, music_path: str | None, out_wav: str, target_sec: int):
+def mix_voice_and_music(voice_wav: str, music_path, out_wav: str, target_sec: int):
     if not music_path:
         sh(f'ffmpeg -y -i "{voice_wav}" -t {target_sec} -af "apad=pad_dur={target_sec}" "{out_wav}"')
         return
-
     sh(
         f'ffmpeg -y -stream_loop -1 -i "{music_path}" -i "{voice_wav}" '
         f'-filter_complex '
@@ -361,22 +284,24 @@ def mix_voice_and_music(voice_wav: str, music_path: str | None, out_wav: str, ta
         f'-map "[a]" -t {target_sec} "{out_wav}"'
     )
 
-# -------------------- VIDEO (MOVIMENTO SEGURO) --
-def build_slideshow_concat_motion(img_paths: list[str], dur_sec: float, out_mp4: str):
+def escape_concat_path(p: str) -> str:
+    # concat demuxer: caminho entre aspas simples; escapa ' virando '\'' (estilo shell)
+    return p.replace("'", "'\\''")
+
+def build_slideshow_concat_motion(img_paths, dur_sec: float, out_mp4: str):
     if not img_paths:
         raise RuntimeError("Sem imagens para slideshow.")
     per = max(3.5, dur_sec / len(img_paths))
 
-    txt = os.path.join(tempfile.mkdtemp(), "list.txt")
+    tmpdir = tempfile.mkdtemp()
+    txt = os.path.join(tmpdir, "list.txt")
+
     with open(txt, "w", encoding="utf-8") as f:
         for p in img_paths:
-            p_esc = p.replace("'", "'\\''")
-            f.write(f"file '{p_esc}'\n")
+            f.write(f"file '{escape_concat_path(p)}'\n")
             f.write(f"duration {per:.3f}\n")
-        f.write(f"file '{img_paths[-1].replace(\"'\", \"'\\\\''\")}'\n")
+        f.write(f"file '{escape_concat_path(img_paths[-1])}'\n")
 
-    # Movimento seguro: scale up + crop com oscilação leve usando sin/cos no tempo (t)
-    # Sem xfade, sem zoompan.
     vf = (
         f"scale=iw*1.10:ih*1.10,"
         f"crop={W}:{H}:"
@@ -385,23 +310,15 @@ def build_slideshow_concat_motion(img_paths: list[str], dur_sec: float, out_mp4:
         f"fps={FPS},format=yuv420p"
     )
 
-    sh(
-        f'ffmpeg -y -f concat -safe 0 -i "{txt}" '
-        f'-vf "{vf}" -t {dur_sec:.3f} -movflags +faststart "{out_mp4}"'
-    )
-
     try:
-        shutil.rmtree(os.path.dirname(txt), ignore_errors=True)
-    except:
-        pass
+        sh(
+            f'ffmpeg -y -f concat -safe 0 -i "{txt}" '
+            f'-vf "{vf}" -t {dur_sec:.3f} -movflags +faststart "{out_mp4}"'
+        )
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
 
-# -------------------- WORK ORDERS ---------------
 def normalize_jobs(raw):
-    if isinstance(raw, str):
-        try:
-            raw = json.loads(raw)
-        except:
-            return []
     if isinstance(raw, dict):
         raw = raw.get("orders", [])
     if isinstance(raw, list):
@@ -417,7 +334,6 @@ def get_latest_work_orders(svc, cfg_id: str):
     raw = json.loads(download_text(svc, fid))
     return normalize_jobs(raw), r["files"][0]["name"]
 
-# -------------------- MAIN ----------------------
 def preflight():
     sh("ffmpeg -version")
     sh("ffprobe -version")
@@ -460,7 +376,6 @@ def main():
     mus_bg    = ensure_folder(svc, ROOT, "01_assets_musicas")
     mus_am    = ensure_folder(svc, ROOT, "01_assets_musicas_ave_maria")
 
-    state, state_fid = load_state(svc, cfg_id)
     jobs, wo_name = get_latest_work_orders(svc, cfg_id)
 
     now_utc = datetime.now(timezone.utc)
@@ -502,7 +417,6 @@ def main():
                 log_lines.append(f"[SKIP] já existe output job_id={job_id} slot={slot} lang={lang}")
                 continue
 
-            # TSV
             candidates = [f"run_{slot}_{lang}.tsv", f"run_{slot}.tsv"]
             tsv_file_id = None
             for nm in candidates:
@@ -525,33 +439,23 @@ def main():
             faixa_job = to_str(job.get("faixa_ave_maria"))
             faixa_ave = faixa_job or faixa_ave_maria_tsv
 
-            # TTS
             voice_wav = os.path.join(tmpdir, f"voice_{job_id}.wav")
             build_tts_wav(narr_text, voice_wav, lang)
             voice_len = ffprobe_duration(voice_wav)
 
-            # Imagens anti repetição
-            state.setdefault("recent_images", {})
-            state.setdefault("recent_music", {})
-            recent_imgs = state["recent_images"].get(lang, [])
-
             base_folder = img_maria if "maria" in slot else img_jesus
-            img_paths, img_names = download_many_images(svc, base_folder, limit=20, avoid_names=recent_imgs)
+            img_paths, img_names = download_many_images(svc, base_folder, limit=20)
             if len(img_paths) < 1:
-                img_paths, img_names = download_many_images(svc, brolls, limit=10, avoid_names=recent_imgs)
+                img_paths, img_names = download_many_images(svc, brolls, limit=10)
             if len(img_paths) < 1:
                 raise RuntimeError("Sem imagens disponíveis (assets).")
 
-            # Vídeo com movimento seguro
             base_dur = min(max(voice_len, MIN_SLIDESHOW_SEC), target_sec)
             vid_mp4 = os.path.join(tmpdir, f"slideshow_{job_id}.mp4")
             build_slideshow_concat_motion(img_paths, base_dur, vid_mp4)
 
-            # Música anti repetição
-            recent_music = state["recent_music"].get(lang, [])
             music_path = None
             music_name = None
-
             if slot == "maria_v2" and musica_policy == "ave_maria":
                 if faixa_ave:
                     cand = list_by_name(svc, mus_am, faixa_ave)
@@ -560,14 +464,13 @@ def main():
                         download_binary(svc, cand[0]["id"], music_path)
                         music_name = faixa_ave
                 if not music_path:
-                    music_path, music_name = pick_random_local(svc, mus_am, AUD_EXTS, avoid_names=recent_music)
+                    music_path, music_name = pick_random_local(svc, mus_am, AUD_EXTS)
             else:
-                music_path, music_name = pick_random_local(svc, mus_bg, AUD_EXTS, avoid_names=recent_music)
+                music_path, music_name = pick_random_local(svc, mus_bg, AUD_EXTS)
 
             mix_wav = os.path.join(tmpdir, f"mix_{job_id}.wav")
             mix_voice_and_music(voice_wav, music_path, mix_wav, target_sec)
 
-            # Mux final
             final_mp4 = os.path.join(tmpdir, f"{job_id}.mp4")
             sh(
                 f'ffmpeg -y -stream_loop -1 -i "{vid_mp4}" -i "{mix_wav}" '
@@ -578,26 +481,14 @@ def main():
                 f'"{final_mp4}"'
             )
 
-            # Thumbnail
             thumb_jpg = os.path.join(tmpdir, f"{job_id}.jpg")
             make_thumb(img_paths[0], title or slot, thumb_jpg)
 
-            # Upload
             upload_file(svc, out_folder, final_mp4, f"{job_id}.mp4", "video/mp4")
             upload_file(svc, th_ids.get(lang, th_ids["pt"]), thumb_jpg, f"{job_id}.jpg", "image/jpeg")
 
-            # Atualiza state
-            state["recent_images"][lang] = state["recent_images"].get(lang, [])
-            state["recent_music"][lang] = state["recent_music"].get(lang, [])
-            for nm in img_names[:6]:
-                state["recent_images"][lang] = push_recent(state["recent_images"][lang], nm, max_len=80)
-            if music_name:
-                state["recent_music"][lang] = push_recent(state["recent_music"][lang], music_name, max_len=50)
-
             processed += 1
             log_lines.append(f"[OK] job_id={job_id} slot={slot} lang={lang} publishAt={dt_pub.isoformat()} music={music_name or 'none'}")
-
-        save_state(svc, cfg_id, state, state_fid)
 
         logname = f"log_renderer_{datetime.utcnow().strftime('%Y%m%d-%H%M%S')}.txt"
         txt = "\n".join(log_lines + [f"status:OK processed:{processed} skipped:{skipped}"])
