@@ -3,8 +3,6 @@ name: render
 on:
   workflow_dispatch: {}
   schedule:
-    # Cron frequente (UTC): a cada 30 minutos
-    # O renderer decide o que renderizar com base em publishAt (janela HORIZON_HOURS)
     - cron: "*/30 * * * *"
 
 concurrency:
@@ -17,10 +15,13 @@ jobs:
 
     env:
       DRIVE_ROOT_FOLDER_ID:   ${{ secrets.DRIVE_ROOT_FOLDER_ID }}
-      SHEET_ID:              ${{ secrets.SHEET_ID }}
-      SERVICE_ACCOUNT_JSON:  ${{ secrets.SERVICE_ACCOUNT_JSON }}
 
-      # Janela de produção: renderiza apenas jobs com publishAt dentro das próximas 12h
+      # OAuth HUMANO (obrigatório nesta versão do renderer)
+      OAUTH_CLIENT_ID:        ${{ secrets.OAUTH_CLIENT_ID }}
+      OAUTH_CLIENT_SECRET:    ${{ secrets.OAUTH_CLIENT_SECRET }}
+      OAUTH_REFRESH_TOKEN:    ${{ secrets.OAUTH_REFRESH_TOKEN }}
+
+      # Janela de produção
       HORIZON_HOURS: "12"
 
     steps:
