@@ -1,9 +1,9 @@
 # scripts/renderer.py
-# Renderer QUEUE-AWARE + IDEMPOTENTE + MOVIMENTO SEGURO
-# - Prioriza SERVICE_ACCOUNT_JSON
-# - Processa publishAt dentro de HORIZON_HOURS
-# - Sem duplicação por job_id
-# - Slideshow com movimento seguro: scale+crop com oscilação (sem xfade/zoompan)
+# Renderer QUEUE-AWARE + IDEMPOTENTE + MOVIMENTO SEGURO (OAUTH HUMANO)
+# - Usa OAuth (refresh token) para ler/gravar no Drive pessoal
+# - Processa apenas jobs com publishAt dentro da janela HORIZON_HOURS
+# - Não duplica: pula se já existir output com job_id
+# - Slideshow com movimento seguro: concat + scale+crop oscilante (sem xfade/zoompan)
 
 import os, io, json, random, tempfile, shutil, re, math, argparse
 from datetime import datetime, timezone, timedelta
@@ -13,10 +13,10 @@ from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseUpload, MediaIoBaseDownload
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
-from google.oauth2 import service_account
 
 from PIL import Image, ImageDraw, ImageFont
 
+# -------------------- CONFIG --------------------
 TARGET_SEC_DEFAULT = 480
 FPS = 30
 W, H = 1920, 1080
@@ -38,6 +38,7 @@ SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets.readonly",
 ]
 
+# -------------------- SHELL ---------------------
 def sh(cmd: str) -> str:
     cp = sp.run(cmd, shell=True, stdout=sp.PIPE, stderr=sp.STDOUT, text=True)
     if cp.returncode != 0:
@@ -72,18 +73,14 @@ def parse_iso_utc(s: str):
     except Exception:
         return None
 
-def build_drive_service():
-    sa_json = os.getenv("SERVICE_ACCOUNT_JSON", "").strip()
-    if sa_json:
-        info = json.loads(sa_json)
-        creds = service_account.Credentials.from_service_account_info(info, scopes=SCOPES)
-        return build("drive", "v3", credentials=creds)
-
+# -------------------- AUTH (OAUTH) --------------
+def build_drive_service_oauth():
     client_id = os.getenv("OAUTH_CLIENT_ID", "").strip()
     client_secret = os.getenv("OAUTH_CLIENT_SECRET", "").strip()
     refresh_token = os.getenv("OAUTH_REFRESH_TOKEN", "").strip()
+
     if not (client_id and client_secret and refresh_token):
-        raise RuntimeError("Defina SERVICE_ACCOUNT_JSON (preferencial) ou OAuth legado completo.")
+        raise RuntimeError("Secrets OAuth incompletos. Verifique OAUTH_CLIENT_ID / OAUTH_CLIENT_SECRET / OAUTH_REFRESH_TOKEN.")
 
     creds = Credentials(
         None,
@@ -96,6 +93,7 @@ def build_drive_service():
     creds.refresh(Request())
     return build("drive", "v3", credentials=creds)
 
+# -------------------- DRIVE HELPERS -------------
 def list_by_name(svc, parent_id: str, name: str):
     q = f"'{parent_id}' in parents and trashed=false and name='{name}'"
     r = svc.files().list(q=q, fields="files(id,name)").execute()
@@ -143,12 +141,9 @@ def upload_file(svc, parent_id: str, local_path: str, name: str, mime: str) -> s
     media = MediaIoBaseUpload(open(local_path, "rb"), mimetype=mime, resumable=True)
     return svc.files().create(body=meta, media_body=media, fields="id").execute()["id"]
 
-def pick_random_local(svc, folder_id: str, exts, avoid_names=None):
-    avoid_names = set([n.lower() for n in (avoid_names or [])])
+def pick_random_local(svc, folder_id: str, exts):
     files = list_files_in_folder(svc, folder_id)
-    cand = [f for f in files if any(f["name"].lower().endswith(e) for e in exts) and f["name"].lower() not in avoid_names]
-    if not cand:
-        cand = [f for f in files if any(f["name"].lower().endswith(e) for e in exts)]
+    cand = [f for f in files if any(f["name"].lower().endswith(e) for e in exts)]
     if not cand:
         return None, None
     f = random.choice(cand)
@@ -168,6 +163,7 @@ def download_many_images(svc, folder_id: str, limit: int):
         paths.append(tmp); names.append(f["name"])
     return paths, names
 
+# -------------------- TSV -----------------------
 def load_tsv_rows(tsv_path: str):
     rows = []
     with open(tsv_path, "r", encoding="utf-8") as f:
@@ -179,14 +175,22 @@ def load_tsv_rows(tsv_path: str):
             head0 = parts[0].strip().lower()
             if head0 in ("run", "passo_ordem"):
                 continue
+
             if len(parts) >= 4:
                 try: ord_ = int(parts[1])
                 except: continue
                 tipo = to_str(parts[2]).lower()
                 txt  = to_str(parts[3])
+            elif len(parts) >= 3:
+                try: ord_ = int(parts[0])
+                except: continue
+                tipo = to_str(parts[1]).lower()
+                txt  = to_str(parts[2])
             else:
                 continue
+
             rows.append({"ord": ord_, "tipo": tipo, "txt": txt})
+
     rows.sort(key=lambda x: x["ord"])
     return rows
 
@@ -194,26 +198,26 @@ def narration_from_rows(rows):
     texts = []
     policy = "bg_random"
     faixa_ave_maria = ""
+
     for r in rows:
         t = r["tipo"]
         if t == "musica_policy":
-            policy = to_str(r["txt"]).lower()
-            continue
+            policy = to_str(r["txt"]).lower(); continue
         if t == "faixa_ave_maria":
-            faixa_ave_maria = to_str(r["txt"])
-            continue
+            faixa_ave_maria = to_str(r["txt"]); continue
         if t in SAY_TYPES:
             val = to_str(r["txt"])
-            if val:
-                texts.append(val)
+            if val: texts.append(val)
 
     base = " ".join(texts).strip() or "Oração de paz e esperança. Que Deus abençoe o seu dia."
     words = base.split()
     if len(words) < 700:
         rep = max(1, math.ceil(900 / max(1, len(words))))
         base = (" " + (base + " ")).join([""] * rep).strip()
+
     return base, policy, faixa_ave_maria
 
+# -------------------- THUMB ---------------------
 def make_thumb(base_img, title, out_jpg):
     img = Image.open(base_img).convert("RGB").resize((W, H))
     draw = ImageDraw.Draw(img)
@@ -228,8 +232,7 @@ def make_thumb(base_img, title, out_jpg):
     lines, line = [], ""
     for w in words:
         test = (line + " " + w).strip()
-        if len(test) <= 22:
-            line = test
+        if len(test) <= 22: line = test
         else:
             if line: lines.append(line)
             line = w
@@ -245,6 +248,7 @@ def make_thumb(base_img, title, out_jpg):
 
     img.convert("RGB").save(out_jpg, "JPEG", quality=92)
 
+# -------------------- TTS -----------------------
 def build_tts_wav(text: str, out_wav: str, lang: str):
     text = text.replace('"', "")
     try:
@@ -270,6 +274,7 @@ def build_tts_wav(text: str, out_wav: str, lang: str):
     sh(f'ffmpeg -y -i "{tmp_mp3}" -ac 1 -ar 44100 "{out_wav}"')
     os.remove(tmp_mp3)
 
+# -------------------- AUDIO MIX -----------------
 def mix_voice_and_music(voice_wav: str, music_path, out_wav: str, target_sec: int):
     if not music_path:
         sh(f'ffmpeg -y -i "{voice_wav}" -t {target_sec} -af "apad=pad_dur={target_sec}" "{out_wav}"')
@@ -284,8 +289,8 @@ def mix_voice_and_music(voice_wav: str, music_path, out_wav: str, target_sec: in
         f'-map "[a]" -t {target_sec} "{out_wav}"'
     )
 
+# -------------------- VIDEO (MOVIMENTO SEGURO) --
 def escape_concat_path(p: str) -> str:
-    # concat demuxer: caminho entre aspas simples; escapa ' virando '\'' (estilo shell)
     return p.replace("'", "'\\''")
 
 def build_slideshow_concat_motion(img_paths, dur_sec: float, out_mp4: str):
@@ -318,6 +323,7 @@ def build_slideshow_concat_motion(img_paths, dur_sec: float, out_mp4: str):
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
 
+# -------------------- WORK ORDERS ---------------
 def normalize_jobs(raw):
     if isinstance(raw, dict):
         raw = raw.get("orders", [])
@@ -334,6 +340,7 @@ def get_latest_work_orders(svc, cfg_id: str):
     raw = json.loads(download_text(svc, fid))
     return normalize_jobs(raw), r["files"][0]["name"]
 
+# -------------------- MAIN ----------------------
 def preflight():
     sh("ffmpeg -version")
     sh("ffprobe -version")
@@ -346,7 +353,7 @@ def main():
     target_sec = int(args.duration or TARGET_SEC_DEFAULT)
     horizon_hours = int(to_str(os.getenv("HORIZON_HOURS", "12")) or "12")
 
-    svc = build_drive_service()
+    svc = build_drive_service_oauth()
     ROOT = to_str(os.getenv("DRIVE_ROOT_FOLDER_ID"))
     if not ROOT:
         raise RuntimeError("DRIVE_ROOT_FOLDER_ID não definido.")
@@ -398,12 +405,9 @@ def main():
 
             if not dt_pub:
                 skipped += 1
-                log_lines.append(f"[SKIP] sem publishAt slot={slot} lang={lang}")
                 continue
-
             if not (now_utc <= dt_pub <= window_end):
                 skipped += 1
-                log_lines.append(f"[SKIP] fora janela publishAt={dt_pub.isoformat()} slot={slot} lang={lang}")
                 continue
 
             job_id = to_str(job.get("job_id") or job.get("id") or "")
@@ -414,7 +418,6 @@ def main():
             out_folder = out_ids.get(lang, out_ids["pt"])
             if file_exists_by_name_contains(svc, out_folder, job_id):
                 skipped += 1
-                log_lines.append(f"[SKIP] já existe output job_id={job_id} slot={slot} lang={lang}")
                 continue
 
             candidates = [f"run_{slot}_{lang}.tsv", f"run_{slot}.tsv"]
@@ -426,7 +429,6 @@ def main():
                     break
             if not tsv_file_id:
                 skipped += 1
-                log_lines.append(f"[SKIP] TSV não encontrado slot={slot} lang={lang}")
                 continue
 
             tsv_local = os.path.join(tmpdir, f"run_{slot}_{lang}.tsv")
@@ -444,9 +446,9 @@ def main():
             voice_len = ffprobe_duration(voice_wav)
 
             base_folder = img_maria if "maria" in slot else img_jesus
-            img_paths, img_names = download_many_images(svc, base_folder, limit=20)
+            img_paths, _ = download_many_images(svc, base_folder, limit=20)
             if len(img_paths) < 1:
-                img_paths, img_names = download_many_images(svc, brolls, limit=10)
+                img_paths, _ = download_many_images(svc, brolls, limit=10)
             if len(img_paths) < 1:
                 raise RuntimeError("Sem imagens disponíveis (assets).")
 
